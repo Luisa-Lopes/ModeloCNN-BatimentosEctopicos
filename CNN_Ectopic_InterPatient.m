@@ -1,7 +1,7 @@
 %% CNN para classificacao de batimentos ectopicos (divisao inter-paciente)
 % Base: MITBIH_Beats.mat
 % Estrutura esperada da base:
-%   beats    -> 181 x N
+%   beats    -> N x 300 ou 300 x N
 %   labels   -> 1 x N, com 0 = normal e 1 = ectopico
 %   patientId -> 1 x N, identifica o paciente
 %
@@ -24,18 +24,50 @@ if size(beats, 2) ~= numel(labels)
     beats = beats.';
 end
 
-%% 2) Divisao inter-paciente (70% treino, 15% validacao, 15% teste)
+%% 2) Divisao inter-paciente estratificada (70% treino, 15% validacao, 15% teste)
+% Cada paciente permanece inteiro em um unico conjunto. A alocacao usa a
+% quantidade de ectopicos por paciente para evitar concentrar essa classe.
 patientList = unique(patientId);
-rng(42);
-patientList = patientList(randperm(numel(patientList)));
-
 nPatients = numel(patientList);
-idxTrainEnd = round(0.70 * nPatients);
-idxValEnd   = idxTrainEnd + round(0.15 * nPatients);
 
-trainPatients = patientList(1:idxTrainEnd);
-valPatients   = patientList(idxTrainEnd+1:idxValEnd);
-testPatients  = patientList(idxValEnd+1:end);
+patientEctopicCount = zeros(nPatients, 1);
+patientBeatCount = zeros(nPatients, 1);
+for i = 1:nPatients
+    patientMask = patientId == patientList(i);
+    patientEctopicCount(i) = sum(labels(patientMask) == 1);
+    patientBeatCount(i) = sum(patientMask);
+end
+
+rng(42);
+tieBreaker = rand(nPatients, 1);
+[~, patientOrder] = sortrows([-patientEctopicCount, -patientBeatCount, tieBreaker]);
+
+splitFractions = [0.80, 0.10, 0.10];
+targetPatients = max(1, round(splitFractions * nPatients));
+targetPatients(1) = nPatients - targetPatients(2) - targetPatients(3);
+targetEctopics = splitFractions * sum(patientEctopicCount);
+
+splitOfPatient = zeros(nPatients, 1);
+assignedPatients = zeros(1, 3);
+assignedEctopics = zeros(1, 3);
+
+for k = 1:nPatients
+    patientIndex = patientOrder(k);
+    availableSplits = find(assignedPatients < targetPatients);
+
+    % Prioriza o conjunto com maior deficit proporcional de ectopicos.
+    ectopicDeficit = (targetEctopics - assignedEctopics) ./ targetEctopics;
+    ectopicDeficit(setdiff(1:3, availableSplits)) = -Inf;
+    [~, selectedSplit] = max(ectopicDeficit);
+
+    splitOfPatient(patientIndex) = selectedSplit;
+    assignedPatients(selectedSplit) = assignedPatients(selectedSplit) + 1;
+    assignedEctopics(selectedSplit) = assignedEctopics(selectedSplit) + patientEctopicCount(patientIndex);
+end
+
+trainPatients = patientList(splitOfPatient == 1);
+valPatients   = patientList(splitOfPatient == 2);
+testPatients  = patientList(splitOfPatient == 3);
 
 trainMask = ismember(patientId, trainPatients);
 valMask   = ismember(patientId, valPatients);
@@ -46,11 +78,20 @@ if sum(trainMask) == 0 || sum(valMask) == 0 || sum(testMask) == 0
     error('A divisao inter-paciente gerou algum conjunto vazio. Ajuste a proporcao de pacientes ou verifique os IDs da base.');
 end
 
+splitEctopicCounts = [sum(labels(trainMask) == 1), ...
+    sum(labels(valMask) == 1), sum(labels(testMask) == 1)];
+fprintf('Ectopicos por conjunto: treino=%d, validacao=%d, teste=%d\n', ...
+    splitEctopicCounts(1), splitEctopicCounts(2), splitEctopicCounts(3));
+
+if any(splitEctopicCounts == 0)
+    error('A divisao inter-paciente deixou algum conjunto sem ectopicos. Ajuste a base ou as proporcoes.');
+end
+
 %% 3) Monta os tensores de entrada
 % Cada batimento e transformado em um tensor [181 x 1 x 1 x N]
-Xtrain = reshape(beats(:, trainMask), [181, 1, 1, sum(trainMask)]);
-Xval   = reshape(beats(:, valMask),   [181, 1, 1, sum(valMask)]);
-Xtest  = reshape(beats(:, testMask),  [181, 1, 1, sum(testMask)]);
+Xtrain = reshape(beats(:, trainMask), [300, 1, 1, sum(trainMask)]);
+Xval   = reshape(beats(:, valMask),   [300, 1, 1, sum(valMask)]);
+Xtest  = reshape(beats(:, testMask),  [300, 1, 1, sum(testMask)]);
 
 Ytrain = categorical(labels(trainMask), [0 1], {'Normal', 'Ectopic'});
 Yval   = categorical(labels(valMask),   [0 1], {'Normal', 'Ectopic'});
@@ -62,7 +103,7 @@ classNames = categories(Ytrain);
 % (S1 e S2), dropout apos C2, C4, F1 e F2, e tres camadas densas
 % (a ultima foi ajustada para as duas classes desta base).
 layers = [
-    imageInputLayer([181 1 1], 'Name', 'input', 'Normalization', 'none')
+    imageInputLayer([300 1 1], 'Name', 'input', 'Normalization', 'none')
 
     convolution2dLayer([5 1], 32, 'Padding', 'same', 'Name', 'conv1')
     reluLayer('Name', 'relu1')
@@ -95,7 +136,7 @@ layers = [
 validationFrequency = floor(numel(Ytrain) / 256);
 
 options = trainingOptions('adam', ...
-    'InitialLearnRate', 1e-3, ...
+    'InitialLearnRate', 1e-4, ...
     'MaxEpochs', 50, ...
     'MiniBatchSize', 256, ...
     'Shuffle', 'every-epoch', ...
@@ -136,6 +177,16 @@ candidateIdx = find(abs(f1Val - bestF1Val) < eps);
 [~, nearestToHalf] = min(abs(thresholds(candidateIdx) - 0.5));
 bestIdx = candidateIdx(nearestToHalf);
 optimalThreshold = thresholds(bestIdx);
+
+% Salva a rede e os parametros necessarios para inferencia em outros pacientes.
+modelPath = fullfile(fileparts(mfilename('fullpath')), ...
+    'CNN_Ectopic_InterPatient.mat');
+windowBefore = 150;
+windowAfter = 149;
+inputLength = windowBefore + windowAfter + 1;
+save(modelPath, 'net', 'classNames', 'optimalThreshold', ...
+    'windowBefore', 'windowAfter', 'inputLength');
+fprintf('Modelo salvo em: %s\n', modelPath);
 
 % Aplica no teste somente o limiar definido acima.
 [~, scoresTest] = classify(net, Xtest);

@@ -23,101 +23,79 @@ if size(beats, 2) ~= numel(labels)
     beats = beats.';
 end
 
-%% 2) Divisao intra-paciente
-% Para a divisao intra-paciente, cada paciente e separado em conjunto de treino,
-% validacao e teste de acordo com a proporcao dos batimentos daquele paciente.
+%% 2) Divisao intra-paciente estratificada
+% Cada paciente aparece nos tres conjuntos quando possui amostras suficientes.
+% A estratificacao e feita separadamente para Normal e Ectopic dentro de cada
+% paciente, preservando a proporcao das classes em treino, validacao e teste.
 
 patientList = unique(patientId);
-idxTrain = [];
-idxVal   = [];
-idxTest  = [];
+splitFractions = [0.70, 0.15, 0.15];
+idxTrain = zeros(numel(labels), 1);
+idxVal   = zeros(numel(labels), 1);
+idxTest  = zeros(numel(labels), 1);
+trainCount = 0;
+valCount = 0;
+testCount = 0;
 
 rng(42);
 
 for i = 1:numel(patientList)
     pid = patientList(i);
-    idxPaciente = find(patientId == pid);
-    labelsPaciente = labels(idxPaciente);
+    patientIndices = find(patientId == pid);
 
-    % Embaralha os indices do paciente
-    idxPaciente = idxPaciente(randperm(numel(idxPaciente)));
+    for classValue = [0, 1]
+        classIndices = patientIndices(labels(patientIndices) == classValue);
+        classIndices = classIndices(randperm(numel(classIndices)));
+        nClass = numel(classIndices);
 
-    % Proporcao 70/15/15 dentro do paciente
-    n = numel(idxPaciente);
-    nTrain = floor(0.70 * n);
-    nVal   = floor(0.15 * n);
-    nTest  = n - nTrain - nVal;
+        nTrain = round(splitFractions(1) * nClass);
+        nVal   = round(splitFractions(2) * nClass);
+        nTest  = nClass - nTrain - nVal;
 
-    % Ajusta para garantir que exista ao menos 1 amostra em cada conjunto
-    if nTrain == 0, nTrain = 1; end
-    if nVal == 0 && n > 1, nVal = 1; end
-    if nTest == 0 && n > 1, nTest = 1; end
-
-    % Recalcula para garantir que a soma nao exceda o total do paciente
-    totalAjustado = nTrain + nVal + nTest;
-    while totalAjustado > n
-        if nTest > 0
-            nTest = nTest - 1;
-        elseif nVal > 0
-            nVal = nVal - 1;
-        else
-            nTrain = nTrain - 1;
+        % Corrige arredondamentos sem perder ou duplicar amostras.
+        while nTest < 0
+            [~, largestSplit] = max([nTrain, nVal, nTest]);
+            if largestSplit == 1
+                nTrain = nTrain - 1;
+            else
+                nVal = nVal - 1;
+            end
+            nTest = nClass - nTrain - nVal;
         end
-        totalAjustado = nTrain + nVal + nTest;
+
+        trainEnd = nTrain;
+        valEnd = nTrain + nVal;
+        idxTrain(trainCount + (1:nTrain)) = classIndices(1:trainEnd);
+        idxVal(valCount + (1:nVal)) = classIndices(trainEnd+1:valEnd);
+        idxTest(testCount + (1:nTest)) = classIndices(valEnd+1:end);
+        trainCount = trainCount + nTrain;
+        valCount = valCount + nVal;
+        testCount = testCount + nTest;
     end
-
-    % Se ainda ficou zero em algum conjunto, corrige
-    if nTrain == 0 && n > 1, nTrain = 1; end
-    if nVal == 0 && n > 2, nVal = 1; end
-    if nTest == 0 && n > 3, nTest = 1; end
-
-    % Reajuste final para evitar excesso
-    while nTrain + nVal + nTest > n
-        if nTest > 0
-            nTest = nTest - 1;
-        elseif nVal > 0
-            nVal = nVal - 1;
-        else
-            nTrain = nTrain - 1;
-        end
-    end
-
-    % Garante que o total do paciente continue sendo usado
-    if nTrain + nVal + nTest < n
-        restante = n - (nTrain + nVal + nTest);
-        nTest = nTest + restante;
-    end
-
-    % Distribuicao final
-    trainIdx = idxPaciente(1:nTrain);
-    valIdx   = idxPaciente(nTrain+1:nTrain+nVal);
-    testIdx  = idxPaciente(nTrain+nVal+1:end);
-
-    % Caso o ultimo conjunto fique vazio por algum paciente pequeno
-    if isempty(testIdx) && numel(idxPaciente) > 1
-        testIdx = idxPaciente(end);
-        valIdx = setdiff(valIdx, testIdx);
-    end
-
-    idxTrain = [idxTrain, trainIdx];
-    idxVal   = [idxVal, valIdx];
-    idxTest  = [idxTest, testIdx];
 end
 
-% Remove possiveis indices duplicados ou vazios
-idxTrain = unique(idxTrain(:));
-idxVal   = unique(idxVal(:));
-idxTest  = unique(idxTest(:));
+idxTrain = sort(idxTrain(1:trainCount));
+idxVal   = sort(idxVal(1:valCount));
+idxTest  = sort(idxTest(1:testCount));
 
 % Garante separacao correta
 if isempty(idxTrain) || isempty(idxVal) || isempty(idxTest)
     error('A divisao intra-paciente gerou algum subconjunto vazio. Verifique a quantidade de amostras por paciente.');
 end
 
+splitEctopicCounts = [sum(labels(idxTrain) == 1), ...
+    sum(labels(idxVal) == 1), sum(labels(idxTest) == 1)];
+fprintf('Ectopicos por conjunto: treino=%d, validacao=%d, teste=%d\n', ...
+    splitEctopicCounts(1), splitEctopicCounts(2), splitEctopicCounts(3));
+
+if any(splitEctopicCounts == 0)
+    error('A divisao intra-paciente deixou algum conjunto sem ectopicos. Ajuste a base ou as proporcoes.');
+end
+
 %% 3) Monta os tensores de entrada
-Xtrain = reshape(beats(:, idxTrain), [181, 1, 1, numel(idxTrain)]);
-Xval   = reshape(beats(:, idxVal),   [181, 1, 1, numel(idxVal)]);
-Xtest  = reshape(beats(:, idxTest),  [181, 1, 1, numel(idxTest)]);
+Xtrain = reshape(beats(:, idxTrain), [300, 1, 1, numel(idxTrain)]);
+Xval   = reshape(beats(:, idxVal),   [ 300, 1, 1, numel(idxVal)]);
+Xtest  = reshape(beats(:, idxTest),  [300, 1, 1, numel(idxTest)]);
 
 Ytrain = categorical(labels(idxTrain), [0 1], {'Normal', 'Ectopic'});
 Yval   = categorical(labels(idxVal),   [0 1], {'Normal', 'Ectopic'});
@@ -129,7 +107,7 @@ classNames = categories(Ytrain);
 % (S1 e S2), dropout apos C2, C4, F1 e F2, e tres camadas densas
 % (a ultima foi ajustada para as duas classes desta base).
 layers = [
-    imageInputLayer([181 1 1], 'Name', 'input', 'Normalization', 'none')
+    imageInputLayer([300 1 1], 'Name', 'input', 'Normalization', 'none')
 
     convolution2dLayer([5 1], 32, 'Padding', 'same', 'Name', 'conv1')
     reluLayer('Name', 'relu1')
